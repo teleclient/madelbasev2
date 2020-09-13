@@ -1,6 +1,7 @@
 MadelineProto.log
 bot.madeline
 bot.madeline.lock
+*.lock
 data/
 madeline.phar
 madeline.phar.version

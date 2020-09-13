@@ -2,7 +2,8 @@
 return [
     'logger' => [
         'logger'       => 2,
-        'logger_level' => 2,
+        'logger_level' => 5,
+        'max_size'     => 20 * 1024 * 1024,
     ],
 ];
 /*
@@ -13,10 +14,10 @@ const WARNING       = 2;
 const ERROR         = 1;
 const FATAL_ERROR   = 0;
 
-const NO_LOGGER = 0;
-const DEFAULT_LOGGER = 1;
-const FILE_LOGGER = 2;
-const ECHO_LOGGER = 3;
+const NO_LOGGER       = 0;
+const DEFAULT_LOGGER  = 1;
+const FILE_LOGGER     = 2;
+const ECHO_LOGGER     = 3;
 const CALLABLE_LOGGER = 4;
 
 $settings['serialization']['cleanup_before_serialization'] = true;

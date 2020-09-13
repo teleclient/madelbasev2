@@ -1,5 +1,13 @@
 <?php  declare(strict_types=1);
-date_default_timezone_set('Asia/Tehran');
+//date_default_timezone_set('Asia/Tehran');
+date_default_timezone_set('America/Los_Angeles');
+
+use \danog\MadelineProto\Logger;
+use \danog\MadelineProto\API;
+use \danog\MadelineProto\Tools;
+use \danog\MadelineProto\Magic;
+use \danog\MadelineProto\Shutdown;
+use \danog\MadelineProto\Loop\Generic\GenericLoop;
 
 if (!\file_exists('madeline.php')) {
     \copy('https://phar.madelineproto.xyz/madeline.php', 'madeline.php');
@@ -17,13 +25,13 @@ function getConfig(): array
 {
     if(file_exists('config.php')) {
         $config = include 'config.php';
-        $config['delete_log']   = $config['delete_log']??  true;
-        $config['max_restarts'] = $config['max_restart']?? 1;
+        $config['delete_log']   = $config['delete_log']??  false;
+        $config['max_recycles'] = $config['max_recycles']?? 3;
         return $config;
     } else {
         return [
             'delete_log'   => true,
-            'max_restarts' => 1
+            'max_recycles' => 1
         ];
     }
 }
@@ -56,12 +64,14 @@ function secondsToNexMinute(): int
 }
 
 function toJSON($var, bool $pretty = true): string {
+    if( isset($var['request'])) {
+        unset($var['request']);
+    }
     $opts = JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES;
     $json = \json_encode($var, $opts | ($pretty? JSON_PRETTY_PRINT : 0));
     $json = ($json !== '')? $json : var_export($var, true);
     return $json;
 }
-
 
 function parseCommand(string $msg, string $prefixes = '!/', int $maxParams = 3): array
 {
@@ -82,37 +92,6 @@ function parseCommand(string $msg, string $prefixes = '!/', int $maxParams = 3):
 }
 
 
-function safeStartAndLoop(int $maxRestarts, $MadelineProto, $genLoop = null): void {
-    $restarts = 0;
-    do {
-        try {
-            $MadelineProto->loop(function () use ($MadelineProto, $genLoop) {
-                yield $MadelineProto->start();
-                yield $MadelineProto->setEventHandler('\EventHandler');
-                if($genLoop !== null) {
-                    /*yield*/ $genLoop->start(); // Do NOT use yield.
-                }
-                yield $MadelineProto->loop();
-            });
-            sleep(5);
-            break;
-        } catch (\Throwable $e) {
-            try {
-                $MadelineProto->logger("Surfaced: $e");
-                $MadelineProto->getEventHandler(['async' => false])->report("Surfaced: $e");
-                break;
-            }
-            catch (\Throwable $e) {
-            }
-        }
-    } while ($restarts++ < $maxRestarts);
-}
-
-
-use \danog\MadelineProto\Logger;
-use \danog\MadelineProto\API;
-use \danog\MadelineProto\Loop\Generic\GenericLoop;
-
 class EventHandler extends \danog\MadelineProto\EventHandler
 {
     private $config;
@@ -122,6 +101,7 @@ class EventHandler extends \danog\MadelineProto\EventHandler
     private $startTime;
     private $reportPeers;
     private $loopState;
+    private $processCommands;
 
     public function __construct(?\danog\MadelineProto\APIWrapper $API)
     {
@@ -130,14 +110,14 @@ class EventHandler extends \danog\MadelineProto\EventHandler
         $this->config      = getConfig();
         $this->admins      = [];
         $this->reportPeers = [];
-        //$this->loopState   = false;
+        //$this->processCommands = false;
         $value = file_get_contents('data/loopstate.json');
         $this->loopState = $value === 'on'? true: false;
     }
 
     public function getReportPeers()
     {
-        return $this->reportPeers;
+        return [];
     }
 
     public function getRobotID(): int
@@ -154,7 +134,6 @@ class EventHandler extends \danog\MadelineProto\EventHandler
         file_put_contents('data/loopstate.json', $loopState? 'on' : 'off');
     }
 
-
     public function onStart(): \Generator
     {
         $robot = yield $this->getSelf();
@@ -168,19 +147,31 @@ class EventHandler extends \danog\MadelineProto\EventHandler
             foreach($this->config['report_peers'] as $reportPeer) {
                 switch(strtolower($reportPeer)) {
                     case 'robot':
-                        array_push($this->reportPeers, $this->robotID);
+                        if(!in_array($this->robotID, $this->reportPeers)) {
+                            array_push($this->reportPeers, $this->robotID);
+                        }
                         break;
                     case 'owner':
-                        if(isset($this->ownerID) && $this->ownerID !== $this->robotID) {
+                        if(isset($this->ownerID) && !in_array($this->ownerID, $this->reportPeers)) {
                             array_push($this->reportPeers, $this->ownerID);
                         }
                         break;
                     default:
-                        array_push($this->reportPeers, $reportPeer);
+                        if(!in_array($reportPeer, $this->reportPeers)) {
+                            array_push($this->reportPeers, $reportPeer);
+                        }
                         break;
                 }
             }
         }
+        $msg  = "Report Peers: ";
+        foreach($this->reportPeers as $peer) {
+            $msg .= $peer . '  ';
+        }
+        yield $this->logger($msg, Logger::ERROR);
+        $this->setReportPeers($this->reportPeers);
+
+        $this->processCommands = false;
 
         yield $this->messages->sendMessage([
             'peer'    => $this->robotID,
@@ -204,7 +195,8 @@ class EventHandler extends \danog\MadelineProto\EventHandler
             return;
         }
         if(!isset($update['message']['message'])) {
-            yield $this->echo(toJSON($update).PHP_EOL);
+            yield $this->echo("Empty message-text:<br>".PHP_EOL);
+            yield $this->echo(toJSON($update).'<br>'.PHP_EOL);
             exit;
         }
         $msgOrig   = $update['message']['message']?? null;
@@ -222,17 +214,24 @@ class EventHandler extends \danog\MadelineProto\EventHandler
         $verb    = $command['verb']?? null;
         $params  = $command['params'];
         if($verb) {
-            yield $this->echo(toJSON($command,  false).PHP_EOL);
+            yield $this->echo(toJSON($command,  false).'<br>'.PHP_EOL);
         }
 
         //  log the messages of the robot, or a reply to a message sent by the robot.
         if($byRobot || $toRobot) {
-           yield $this->logger(toJSON($update, false), Logger::ERROR);
+            yield $this->logger("Arrived '$verb' ". ($this->processCommands? 'to be processed.' : 'to be ignored.'), Logger::ERROR);
+            yield $this->logger(toJSON($update, false), Logger::ERROR);
         } else {
             //yield $this->logger(toJSON($update, false), Logger::ERROR);
         }
 
-        if($byRobot && $verb) {
+        if(($byRobot || $toRobot) && $msgOrig === 'Robot just started.') {
+            yield $this->logger("Turned ProcessCommands on", Logger::ERROR);
+            yield $this->echo("Turned ProcessCommands on.<br>".PHP_EOL);
+            $this->processCommands = true;
+        }
+
+        if($byRobot && $verb && $this->processCommands) {
             switch($verb) {
                 case 'help':
                     yield $this->messages->editMessage([
@@ -243,6 +242,8 @@ class EventHandler extends \danog\MadelineProto\EventHandler
                           //"<br>".
                             ">> <b>/help</b><br>".
                             "   To print the robot commands' help.<br>".
+                            ">> <b>/crash</b><br>".
+                            "   To generate an exception for testing.<br>".
                             ">> <b>/loop</b> on/off/state<br>".
                             "   To query/change state of task repeater.<br>".
                             ">> <b>/status</b><br>".
@@ -283,6 +284,9 @@ class EventHandler extends \danog\MadelineProto\EventHandler
                         ]);
                     }
                     break;
+                case 'crash':
+                    yield $this->logger("Purposefully crashing the script....", Logger::ERROR);
+                    throw new \Exception('Artificial exception generated for testing the robot.');
                 case 'status':
                     yield $this->messages->editMessage([
                         'peer'    => $peer,
@@ -315,40 +319,51 @@ class EventHandler extends \danog\MadelineProto\EventHandler
                     yield $this->messages->editMessage([
                         'peer'    => $peer,
                         'id'      => $messageId,
-                        'message' => "Robot's uptime is: ".$memUsage."."
+                        'message' => "Robot's memory usage is: ".$memUsage."."
                     ]);
                     break;
                 case 'restart':
-                    yield $this->messages->editMessage([
+                    yield $this->logger('The robot re-started by the owner.', Logger::ERROR);
+                    $result = yield $this->messages->editMessage([
                         'peer'    => $peer,
                         'id'      => $messageId,
                         'message' => 'Restarting the robot ...',
                     ]);
-                    yield $this->logger('The robot re-started by the owner.');
+                    $date = $result['date'];
                     $this->restart();
                     break;
                 case 'logout':
-                    yield $this->messages->editMessage([
+                    yield $this->logger('the robot is logged out by the owner.', Logger::ERROR);
+                    $result = yield $this->messages->editMessage([
                         'peer'    => $peer,
                         'id'      => $messageId,
                         'message' => 'The robot is logging out. ...',
                     ]);
-                    $this->logger('the robot is logged out by the owner.');
+                    $date = $result['date'];
                     $this->logout();
                 case 'stop':
-                    $this->messages->editMessage([
+                    $result = yield $this->messages->editMessage([
                         'peer'    => $peer,
                         'id'      => $messageId,
                         'message' => 'Robot is stopping ...',
                     ]);
+                    $date = $result['date'];
+                    $json = toJSON($result);
+                    yield $this->logger($json, Logger::ERROR);
+                    if(Shutdown::removeCallback('restarter')) {
+                        yield $this->logger('Self-Restarter disabled.', Logger::ERROR);
+                    }
+                    yield $this->stop();
+                    break;
+                default:
+                    $this->messages->editMessage([
+                        'peer'    => $peer,
+                        'id'      => $messageId,
+                        'message' => 'Invalid command: '. "'".$verb."'",
+                    ]);
                     break;
             } // enf of the command switch
         } // end of the commander qualification check
-
-        //Function: Finnish executing the Stop command.
-        if($byRobot && $msgOrig === 'Robot is stopping ...') {
-            $this->stop();
-        }
     } // end of function
 } // end of the class
 
@@ -375,12 +390,6 @@ $genLoop = new GenericLoop(
             yield $MadelineProto->account->updateProfile([
                 'about' => date('H:i:s')
             ]);
-            //$robotID = $eh->getRobotID();
-            //yield $MadelineProto->messages->sendMessage([
-            //    'peer'    => $robotID,
-            //    'message' => date('H:i:s')
-            //]);
-            //yield $MadelineProto->logger($msg, Logger::ERROR);
         }
         $delay = yield secondsToNexMinute($MadelineProto);
         return $delay; // Repeat around 60 seconds later
@@ -388,7 +397,52 @@ $genLoop = new GenericLoop(
     'Repeating Loop'
 );
 
-$maxRestarts = $config['max_restarts'];
-safeStartAndLoop($maxRestarts, $MadelineProto, $genLoop);
+function safeStartAndLoop(API $MadelineProto, GenericLoop $genLoop = null, int $maxRecycles): void
+{
+    $recycleTimes = [];
+    while(true) {
+        try {
+            $MadelineProto->loop(function () use ($MadelineProto, $genLoop) {
+                yield $MadelineProto->start();
+                yield $MadelineProto->setEventHandler('\EventHandler');
+                if($genLoop !== null) {
+                    /*yield*/ $genLoop->start(); // Do NOT use yield.
+                }
+                // Synchronously wait for the update loop to exit normally.
+                // The update loop exits either on ->stop or ->restart (which also calls ->stop).
+                Tools::wait(yield from $MadelineProto->API->loop());
+                yield $MadelineProto->logger("Update loop exited!");
+                //Magic::shutdown(1);
+            });
+            sleep(5);
+            break;
+        } catch (\Throwable $e) {
+            try {
+                $MadelineProto->logger->logger((string) $e, Logger::FATAL_ERROR);
+                // quit recycling if more than $maxRecycles happened within the last minutes.
+                $now = time();
+                foreach($recycleTimes as $index => $restartTime) {
+                    if($restartTime > $now - 1 * 60) {
+                        break;
+                    }
+                    unset($recycleTimes[$index]);
+                }
+                if(count($recycleTimes) > $maxRecycles) {
+                    // quit for good
+                    Shutdown::removeCallback('restarter');
+                    Magic::shutdown(1);
+                    break;
+                }
+                $recycleTimes[] = $now;
+                $MadelineProto->report("Surfaced: $e");
+            }
+            catch (\Throwable $e) {
+            }
+        }
+    };
+}
 
-exit();
+$maxRecycles = $config['max_recycles'];
+safeStartAndLoop($MadelineProto, $genLoop, $maxRecycles);
+
+exit("gone with the wind!");
